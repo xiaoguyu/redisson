@@ -124,7 +124,8 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         if (ee == null) {
             return;
         }
-        
+
+        // 创建延时任务，延时时间是internalLockLeaseTime / 3
         Timeout task = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
             @Override
             public void run(Timeout timeout) throws Exception {
@@ -136,7 +137,8 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
                 if (threadId == null) {
                     return;
                 }
-                
+
+                // lua脚本判断，如果锁存在，则续期并返回true，不存在则返回false
                 CompletionStage<Boolean> future = renewExpirationAsync(threadId);
                 future.whenComplete((res, e) -> {
                     if (e != null) {
@@ -146,7 +148,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
                     }
                     
                     if (res) {
-                        // reschedule itself
+                        // 锁续期成功，则再启动一个延时任务，继续监测
                         renewExpiration();
                     } else {
                         cancelExpirationRenewal(null);
@@ -159,6 +161,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
     }
     
     protected void scheduleExpirationRenewal(long threadId) {
+        // 创建ExpirationEntry，并放入EXPIRATION_RENEWAL_MAP中，下面的renewExpiration()方法会从map中再拿出来用
         ExpirationEntry entry = new ExpirationEntry();
         ExpirationEntry oldEntry = EXPIRATION_RENEWAL_MAP.putIfAbsent(getEntryName(), entry);
         if (oldEntry != null) {
@@ -166,9 +169,12 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         } else {
             entry.addThreadId(threadId);
             try {
+                // 看门狗的具体逻辑
                 renewExpiration();
             } finally {
+                // 如果线程被中断了，就取消看门狗
                 if (Thread.currentThread().isInterrupted()) {
+                    // 取消看门狗
                     cancelExpirationRenewal(threadId);
                 }
             }
@@ -319,6 +325,7 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         RFuture<Boolean> future = unlockInnerAsync(threadId);
 
         CompletionStage<Void> f = future.handle((opStatus, e) -> {
+            // 取消看门狗
             cancelExpirationRenewal(threadId);
 
             if (e != null) {

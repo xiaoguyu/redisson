@@ -159,6 +159,7 @@ public class RedissonLock extends RedissonBaseLock {
                 if (leaseTime > 0) {
                     internalLockLeaseTime = unit.toMillis(leaseTime);
                 } else {
+                    // 看门狗机制，定时延续锁的过期时间
                     scheduleExpirationRenewal(threadId);
                 }
             }
@@ -170,17 +171,21 @@ public class RedissonLock extends RedissonBaseLock {
     private <T> RFuture<Long> tryAcquireAsync(long waitTime, long leaseTime, TimeUnit unit, long threadId) {
         RFuture<Long> ttlRemainingFuture;
         if (leaseTime > 0) {
+            // 调用lua脚本，尝试加锁
             ttlRemainingFuture = tryLockInnerAsync(waitTime, leaseTime, unit, threadId, RedisCommands.EVAL_LONG);
         } else {
+            // 这里的if、else的区别就在于，如果没有设置leaseTime，就使用默认的internalLockLeaseTime（默认30秒）
             ttlRemainingFuture = tryLockInnerAsync(waitTime, internalLockLeaseTime,
                     TimeUnit.MILLISECONDS, threadId, RedisCommands.EVAL_LONG);
         }
         CompletionStage<Long> f = ttlRemainingFuture.thenApply(ttlRemaining -> {
             // lock acquired
+            // 如果ttlRemaining为空，也就是tryLockInnerAsync方法中的lua执行结果返回空，证明获取锁成功
             if (ttlRemaining == null) {
                 if (leaseTime > 0) {
                     internalLockLeaseTime = unit.toMillis(leaseTime);
                 } else {
+                    // 如果没有设置锁的持有时间（leaseTime），则启动看门狗，定时给锁续期，防止业务逻辑未执行完成锁就过期了
                     scheduleExpirationRenewal(threadId);
                 }
             }
@@ -210,19 +215,30 @@ public class RedissonLock extends RedissonBaseLock {
                 Collections.singletonList(getRawName()), unit.toMillis(leaseTime), getLockName(threadId));
     }
 
+    /**
+     * 获取锁
+     * @param waitTime  尝试获取锁的最大等待时间，超过这个值，则认为获取锁失败
+     * @param leaseTime 锁的持有时间,超过这个时间锁会自动失效（值应设置为大于业务处理的时间，确保在锁有效期内业务能处理完）
+     * @param unit 时间单位
+     * @return 获取锁成功返回true，失败返回false
+     */
     @Override
     public boolean tryLock(long waitTime, long leaseTime, TimeUnit unit) throws InterruptedException {
         long time = unit.toMillis(waitTime);
-        long current = System.currentTimeMillis();
-        long threadId = Thread.currentThread().getId();
+        long current = System.currentTimeMillis();// 当前时间
+        long threadId = Thread.currentThread().getId();// 当前线程id
+
+        // 尝试加锁，加锁成功返回null，失败返回锁的剩余超时时间
         Long ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
-        // lock acquired
+        // 获取锁成功
         if (ttl == null) {
             return true;
         }
-        
+
+        // time小于0代表此时已经超过获取锁的等待时间，直接返回false
         time -= System.currentTimeMillis() - current;
         if (time <= 0) {
+            // 没看懂这个方法，里面里面空运行，有知道的大神还请不吝赐教
             acquireFailed(waitTime, unit, threadId);
             return false;
         }
@@ -234,6 +250,7 @@ public class RedissonLock extends RedissonBaseLock {
         } catch (TimeoutException e) {
             if (!subscribeFuture.cancel(false)) {
                 subscribeFuture.whenComplete((res, ex) -> {
+                    // 出现异常，取消订阅
                     if (ex == null) {
                         unsubscribe(res, threadId);
                     }
@@ -247,6 +264,7 @@ public class RedissonLock extends RedissonBaseLock {
         }
 
         try {
+            // 判断是否超时（超过了waitTime）
             time -= System.currentTimeMillis() - current;
             if (time <= 0) {
                 acquireFailed(waitTime, unit, threadId);
@@ -254,6 +272,7 @@ public class RedissonLock extends RedissonBaseLock {
             }
         
             while (true) {
+                // 再次获取锁，成功则返回
                 long currentTime = System.currentTimeMillis();
                 ttl = tryAcquire(waitTime, leaseTime, unit, threadId);
                 // lock acquired
@@ -267,7 +286,8 @@ public class RedissonLock extends RedissonBaseLock {
                     return false;
                 }
 
-                // waiting for message
+                // 阻塞等待信号量唤醒或者超时，接收到订阅时唤醒
+                // 使用的是Semaphore#tryAcquire()
                 currentTime = System.currentTimeMillis();
                 if (ttl >= 0 && ttl < time) {
                     commandExecutor.getNow(subscribeFuture).getLatch().tryAcquire(ttl, TimeUnit.MILLISECONDS);
@@ -282,6 +302,7 @@ public class RedissonLock extends RedissonBaseLock {
                 }
             }
         } finally {
+            // 因为是同步操作，所以无论加锁成功或失败，都取消订阅
             unsubscribe(commandExecutor.getNow(subscribeFuture), threadId);
         }
 //        return get(tryLockAsync(waitTime, leaseTime, unit));

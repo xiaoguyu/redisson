@@ -40,13 +40,15 @@ public class LockPubSub extends PublishSubscribe<RedissonLockEntry> {
 
     @Override
     protected void onMessage(RedissonLockEntry value, Long message) {
+        // 普通的解锁走的是这个
         if (message.equals(UNLOCK_MESSAGE)) {
             Runnable runnableToExecute = value.getListeners().poll();
             if (runnableToExecute != null) {
                 runnableToExecute.run();
             }
-
+            // 这里就是唤醒信号量的地方
             value.getLatch().release();
+        // 这个是读写锁用的
         } else if (message.equals(READ_UNLOCK_MESSAGE)) {
             while (true) {
                 Runnable runnableToExecute = value.getListeners().poll();
